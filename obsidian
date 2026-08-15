@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+obsidian -- command line entry point for this repo.
+
+Usage:
+    obsidian db sync [options]
+
+Reads sync.yaml, scans the Obsidian vault, rewrites data.sql and the
+combined script, then rebuilds the Postgres database from them.
+
+Options:
+    -c, --config PATH   Config file to use (default: sync.yaml next to this
+                        script).
+        --build         Also rewrite Section 5 of CS5200_HW10_Pham.sql
+                        with the rows just read from the vault.
+        --dry-run       Do everything except touch the database.
+        --no-verify     Skip the requirement checks after loading.
+    -q, --quiet         Only report warnings and errors.
+
+    ln -s "$PWD/obsidian" ~/bin/obsidian
+"""
+
+import argparse
+import logging
+import logging.handlers
+import os
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import yaml
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+# Re-exec inside the repo's virtualenv if there is one and we are not
+# already in it, so `obsidian db sync` works from any shell without the
+# caller having to remember to activate anything first.
+_VENV = HERE / ".venv"
+_VENV_PYTHON = _VENV / "bin" / "python"
+# Compare prefixes, not executables: .venv/bin/python is a symlink to the
+# system interpreter, so resolving both paths would make them look equal.
+if _VENV_PYTHON.exists() and Path(sys.prefix).resolve() != _VENV.resolve():
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+log = logging.getLogger("obsidian")
+
+
+# ---------------------------------------------------------------- config
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        sys.exit(f"obsidian: no config at {path}")
+    with path.open(encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+
+    for section in ("vault", "database", "output", "sync"):
+        if section not in config:
+            sys.exit(f"obsidian: {path} is missing the '{section}' section")
+
+    vault = Path(config["vault"]["path"]).expanduser()
+    if not vault.is_absolute():
+        vault = (path.parent / vault).resolve()
+    if not vault.is_dir():
+        sys.exit(f"obsidian: vault path does not exist: {vault}")
+    config["vault"]["path"] = vault
+
+    script = Path(config["output"]["script"]).expanduser()
+    config["output"]["script"] = script if script.is_absolute() else path.parent / script
+
+    return config
+
+
+def setup_logging(config: dict, quiet: bool):
+    level = logging.WARNING if quiet else getattr(
+        logging, str(config.get("logging", {}).get("level", "INFO")).upper(), logging.INFO
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_file = config.get("logging", {}).get("file")
+    if log_file:
+        path = Path(log_file)
+        if not path.is_absolute():
+            path = HERE / path
+        handlers.append(
+            logging.handlers.RotatingFileHandler(path, maxBytes=1_000_000, backupCount=2)
+        )
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s",
+                        handlers=handlers, force=True)
+
+
+# ---------------------------------------------------------------- database
+
+def ensure_database(url: str):
+    """Create the target database if it is missing and we are allowed to."""
+    import psycopg2
+
+    name = urlparse(url).path.lstrip("/")
+    if not name:
+        sys.exit("obsidian: database.url has no database name")
+    try:
+        psycopg2.connect(url).close()
+        return
+    except psycopg2.OperationalError as exc:
+        if "does not exist" not in str(exc):
+            raise
+
+    admin_url = url.replace("/" + name, "/postgres", 1)
+    conn = psycopg2.connect(admin_url)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{name}"')
+        log.info("Created database %s", name)
+    finally:
+        conn.close()
+
+
+def strip_transaction_control(sql: str) -> str:
+    keep = [
+        line for line in sql.splitlines()
+        if line.strip().upper() not in ("BEGIN;", "COMMIT;")
+    ]
+    return "\n".join(keep)
+
+
+def run_steps(url: str, steps: list, data_sql: str, load_vault):
+    import psycopg2
+
+    conn = psycopg2.connect(url)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            for step in steps:
+                if step == "data":
+                    log.info("Loading data")
+                    cur.execute(strip_transaction_control(data_sql))
+                    continue
+                log.info("Applying section '%s'", step)
+                cur.execute(strip_transaction_control(load_vault.get_section(step)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.error("Sync failed; the database was rolled back and is unchanged")
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- command
+
+def cmd_db_sync(args):
+    config = load_config(args.config)
+    setup_logging(config, args.quiet)
+
+    mode = "dry-run" if args.dry_run else str(config["sync"].get("mode", "rebuild"))
+    verify = config["sync"].get("verify", True) and not args.no_verify
+
+    # load_vault does the reading and rendering; this script owns the
+    # scheduling, config and database side of the job.
+    os.environ["VAULT_PATH"] = str(config["vault"]["path"])
+    import load_vault
+
+    load_vault.VAULT_PATH = config["vault"]["path"]
+    load_vault.SUBMISSION_SQL = config["output"]["script"]
+
+    started = time.monotonic()
+    log.info("Scanning %s", config["vault"]["path"])
+    model = load_vault.build_model()
+
+    # The rendered INSERTs go straight to Postgres. Writing them back into
+    # Section 5 of the script is a separate, optional step: the vault is the
+    # source of truth, the file is a rendering of it.
+    data_sql = load_vault.write_data_sql(model)
+    build = args.build or config["output"].get("write_data_section", False)
+
+    if build:
+        load_vault.splice_data(data_sql)
+
+    if mode == "dry-run":
+        if not build:
+            log.info("Dry run: nothing written and database untouched. "
+                     "Add --build to refresh Section 5 of the script.")
+        log.info("Dry run finished in %.1fs", time.monotonic() - started)
+        return 0
+
+    if mode != "rebuild":
+        sys.exit(f"obsidian: unknown sync.mode '{mode}' (expected rebuild or dry-run)")
+
+    url = config["database"]["url"]
+    if config["database"].get("create_if_missing", True):
+        ensure_database(url)
+
+    run_steps(url, config["sync"].get("steps", []), data_sql, load_vault)
+    log.info("Synced %d notes into %s in %.1fs",
+             len(model["nodes"]), urlparse(url).path.lstrip("/"),
+             time.monotonic() - started)
+
+    if verify:
+        os.environ["DATABASE_URL"] = url
+        load_vault.verify()
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="obsidian", add_help=True)
+    subcommands = parser.add_subparsers(dest="group", required=True)
+
+    db_parser = subcommands.add_parser("db", help="database commands")
+    db_actions = db_parser.add_subparsers(dest="action", required=True)
+
+    sync_parser = db_actions.add_parser(
+        "sync", help="sync the Obsidian vault into Postgres"
+    )
+    sync_parser.add_argument("-c", "--config", type=Path, default=HERE / "sync.yaml")
+    sync_parser.add_argument(
+        "--build", action="store_true",
+        help="also write data.sql and the combined submission script",
+    )
+    sync_parser.add_argument("--dry-run", action="store_true")
+    sync_parser.add_argument("--no-verify", action="store_true")
+    sync_parser.add_argument("-q", "--quiet", action="store_true")
+    sync_parser.set_defaults(func=cmd_db_sync)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

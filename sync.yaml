@@ -1,0 +1,47 @@
+# Configuration for `obsidian db sync`.
+#
+# Everything the sync job needs lives here, so the command itself never
+# takes a pile of flags. Paths are relative to this file unless absolute.
+
+vault:
+  # The Obsidian vault to read. Every .md file under it is scanned;
+  # dotfolders (.obsidian, .trash, .git) are skipped.
+  path: /Users/cherryyypham/NotakingHub
+
+database:
+  # libpq URL. postgresql:///name uses the local socket and your own role.
+  url: postgresql:///notakinghub_hw10
+  # Create the database if it does not exist yet, instead of failing.
+  create_if_missing: true
+
+output:
+  # The one SQL file: schema, view, function, data, trigger, queries and
+  # demos, in run order. The sync reads its section markers to know what
+  # to run, and rewrites its data section when asked.
+  script: CS5200_HW10_Pham.sql
+  # Rewrite the data section on every sync. Off by default -- a normal
+  # sync loads straight into Postgres and leaves the file alone. Turn this
+  # on, or pass `obsidian db sync --build`, when the file needs the
+  # current vault in it.
+  write_data_section: false
+
+sync:
+  # rebuild -- drop and recreate every table, then load the vault fresh.
+  #            The only honest mode while the loader assigns ids 1..N in
+  #            scan order: an incremental load would collide with them.
+  # dry-run  -- write the SQL files but do not touch the database.
+  mode: rebuild
+
+  # Section numbers from CS5200_HW10_Pham.sql, applied in this order:
+  # drops, schema, view and function, data, trigger. Sections 7 and 8 are
+  # deliberately absent -- a sync loads the vault, it does not run reports
+  # or write demo rows.
+  steps: [2, 3, 4, 5, 6]
+
+  # Print the Part 1 data requirement checks after loading.
+  verify: true
+
+logging:
+  # Appended to on every run. Delete it freely; it is regenerated.
+  file: sync.log
+  level: INFO
